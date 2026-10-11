@@ -1,0 +1,539 @@
+# SPDX-FileCopyrightText: Contributors to powerplantmatching <https://github.com/pypsa/powerplantmatching>
+#
+# SPDX-License-Identifier: MIT
+
+"""
+Functions for vertically cleaning a dataset.
+"""
+
+import contextlib
+import logging
+
+import networkx as nx
+import numpy as np
+import pandas as pd
+import unidecode
+from deprecation import deprecated
+
+from .core import PANDAS_V3, get_config, get_obj_if_Acc
+from .duke import duke
+from .utils import get_name, set_column_name
+
+logger = logging.getLogger(__name__)
+
+
+def mode(x):
+    """
+    Get the most common value of a series.
+    """
+    return x.mode(dropna=False).at[0]
+
+
+AGGREGATION_FUNCTIONS = {
+    "Name": mode,
+    "Fueltype": mode,
+    "Technology": mode,
+    "Set": mode,
+    "Country": mode,
+    "Capacity": "sum",
+    "lat": "mean",
+    "lon": "mean",
+    "DateIn": "min",
+    "DateRetrofit": "max",  # choose latest Retrofit-Year
+    "DateMothball": "min",
+    "DateOut": "max",
+    "File": mode,
+    "projectID": set,
+    "EIC": set,
+    "Duration": "sum",  # note this is weighted sum
+    "Volume_Mm3": "sum",
+    "DamHeight_m": "sum",
+    "StorageCapacity_MWh": "sum",
+    "Efficiency": "sum",  # note this is weighted mean
+}
+
+
+def clean_name(df, config=None):
+    """
+    Clean the name of a power plant list.
+
+    Cleans the column "Name" of the database by deleting very frequent words
+    and nonalphanumerical characters of the column. Returns a  reduced
+    dataframe with nonempty Name-column.
+
+    Parameters
+    ----------
+    df : pandas.Dataframe
+        dataframe to be cleaned
+    config : dict, default None
+        Custom configuration, defaults to
+        `powerplantmatching.config.get_config()`.
+
+    """
+    df = get_obj_if_Acc(df)
+
+    if config is None:
+        config = get_config()
+
+    name = df.Name.fillna("").astype(str).copy().apply(unidecode.unidecode)
+
+    roman_to_arabic = {
+        "I": "1",
+        "II": "2",
+        "III": "3",
+        "IV": "4",
+        "V": "5",
+        "VI": "6",
+        "VII": "7",
+        "VIII": "8",
+        "IX": "9",
+        "X": "10",
+        "XI": "11",
+    }
+    for roman, arabic in roman_to_arabic.items():
+        name = name.str.replace(rf"\b{roman}\b", arabic, regex=True)
+
+    replace = config["clean_name"]["replace"]
+    replace.setdefault("", [])
+
+    keep_blocks = config["clean_name"].get("fueltypes_with_blocks", [])
+    if len(keep_blocks) > 0:
+        mask = df.Fueltype.isin(keep_blocks)
+
+    for key, pattern in replace.items():
+        if config["clean_name"]["remove_common_words"] and (key == ""):
+            common_words = pd.Series(sum(name.str.split(), [])).value_counts()
+            common_words = list(common_words[common_words >= 20].index)
+            pattern += common_words
+
+        pattern = np.atleast_1d(pattern)
+
+        # do not remove block numbers for fuel types with blocks; the regular
+        # regex [^a-zA-Z] removes non-alphabetical characters; for fueltypes to
+        # keep, the regex [^a-zA-Z0-9] is used which only removes
+        # non-alphanumerical characters
+        if len(keep_blocks) > 0 and key == " " and "[^a-zA-Z]" in pattern:
+            base = [rf"\b{p}\b" for p in pattern if p != "[^a-zA-Z]"]
+            pattern_keep = r"(?i)" + "|".join(base + [r"[^a-zA-Z0-9]"])
+            pattern_default = r"(?i)" + "|".join(base + [r"[^a-zA-Z]"])
+            name.loc[mask] = name.loc[mask].str.replace(pattern_keep, key, regex=True)
+            name.loc[~mask] = name.loc[~mask].str.replace(
+                pattern_default, key, regex=True
+            )
+
+        # do not remove block letters for fuel types with blocks; the regular
+        # regex \w would remove standalone letters, this one is skipped for
+        # fueltypes in mask
+        elif key == "" and r"\w" in pattern:
+            pattern_keep = r"(?i)" + "|".join(
+                [rf"\b{p}\b" for p in pattern if p != r"\w"]
+            )
+            pattern_default = r"(?i)" + "|".join([rf"\b{p}\b" for p in pattern])
+            name.loc[mask] = name.loc[mask].str.replace(pattern_keep, key, regex=True)
+            name.loc[~mask] = name.loc[~mask].str.replace(
+                pattern_default, key, regex=True
+            )
+
+        else:
+            pattern = r"(?i)" + "|".join([rf"\b{p}\b" for p in pattern])
+            name = name.str.replace(pattern, key, regex=True)
+
+    # remove duplicated words; second pass necessary for edge cases
+    if config["clean_name"]["remove_duplicated_words"]:
+        name = (
+            name.str.replace(r"\b(\w+)(?:\W\1\b)+", r"\1", regex=True, case=False)
+            .str.strip()
+            .str.replace(r" +", " ", regex=True)
+            .str.title()
+            .str.replace(r"\b(\w+)(?:\W\1\b)+", r"\1", regex=True, case=False)
+        )
+    else:
+        name = name.str.strip().str.title().str.replace(r" +", " ", regex=True)
+
+    return df.assign(Name=name).sort_values("Name")
+
+
+@deprecated(deprecated_in="5.0", details="Use `clean_name` instead.")
+def clean_powerplantname(df, config=None):
+    return clean_name(df, config=config)
+
+
+def config_target_key(column):
+    """
+    Convert a column name to the key that is used to specify the target
+    values in the config.
+
+    Parameters
+    ----------
+    column : str
+        Name of the column.
+
+    Returns
+    -------
+    str
+        Name of the key used in the config file.
+    """
+    if column.endswith("y"):
+        column = column[:-1] + "ie"
+    column = str.lower(column)
+    return f"target_{column}s"
+
+
+def gather_and_replace(df, mapping):
+    """
+    Search for patterns in multiple columns and return a series of represantativ keys.
+
+    The function will return a series of unique identifiers given by the keys of the
+    `mapping` dictionary. The order in the `mapping` dictionary determines which
+    represantativ keys are calculated first. Note that these may be overwritten by
+    the following mappings.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame with columns that should be parsed.
+    mapping : dict
+        Dictionary mapping the represantativ keys to the regex patterns.
+    """
+    assert isinstance(mapping, dict)
+    res = pd.Series(index=df.index, dtype=object)
+    for key, pattern in mapping.items():
+        if not pattern:
+            # if pattern is not given, fall back to case-insensitive key
+            pattern = rf"(?i)\b{key}\b"
+        elif isinstance(pattern, list):
+            # if pattern is a list, concat all entries in a case-insensitive regex
+            pattern = r"(?i)" + "|".join([rf"\b{p}\b" for p in pattern])
+        elif not isinstance(pattern, str):
+            raise ValueError(f"Pattern must be string or list, not {type(pattern)}")
+        where = df.astype(str).apply(lambda ds: ds.str.contains(pattern)).any(axis=1)
+        res = res.where(~where, key)
+    return res
+
+
+def gather_specifications(
+    df,
+    target_columns=["Fueltype", "Technology", "Set"],
+    parse_columns=["Name", "Fueltype", "Technology", "Set"],
+    config=None,
+):
+    """
+    Parse columns to collect representative keys.
+
+
+    This function will parse the columns specified in `parse_columns` and collects
+    the representative keys for each row in `target_columns`. The parsing is based
+    on the config file.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Power plant dataframe.
+    target_columns : list, optional
+        Columns where the representative keys will be collected,
+        by default ["Fueltype", "Technology", "Set"]
+    parse_columns : list, optional
+        Columns that should be parsed, by default
+        ["Name", "Fueltype", "Technology", "Set"]
+    config : dict, default None
+        Custom configuration, defaults to
+        `powerplantmatching.config.get_config()`.
+
+    Returns
+    -------
+    pandas.DataFrame
+    """
+
+    if config is None:
+        config = get_config()
+
+    cols = {}
+    for c in target_columns:
+        target_key = config_target_key(c)
+        keys = config[target_key]
+        cols[c] = gather_and_replace(df[parse_columns], keys)
+
+    return df.assign(**cols)
+
+
+def gather_fueltype_info(
+    df, search_col=["Name", "Fueltype", "Technology"], config=None
+):
+    """
+    Parses in a set of columns for distinct fueltype specifications.
+
+    This function uses the mappings (key -> regex pattern) given
+    by the `config` under the section `target_fueltypes`.
+    The representative keys are set if any of the columns
+    in `search_col` matches the regex pattern.
+
+    Parameter
+    ---------
+    df : pandas.DataFrame
+        DataFrame to be parsed.
+    search_col : list, default is ["Name", "Fueltype", "Technology", "Set"]
+        Set of columns to be parsed. Must be in `df`.
+    config : dict, default None
+        Custom configuration, defaults to
+        `powerplantmatching.config.get_config()`.
+    """
+    if config is None:
+        config = get_config()
+
+    keys = config["target_fueltypes"]
+    fueltype = gather_and_replace(df[search_col], keys)
+    return df.assign(Fueltype=fueltype)
+
+
+@deprecated(
+    deprecated_in="0.5",
+    details="Use `gather_specifications` instead.",
+)
+def gather_technology_info(
+    df, search_col=["Name", "Fueltype", "Technology", "Set"], config=None
+):
+    """
+    Parses in a set of columns for distinct technology specifications.
+
+    This function uses the mappings (key -> regex pattern) given
+    by the `config` under the section `target_technologies`.
+    The representative keys are set if any of the columns
+    in `search_col` matches the regex pattern.
+
+    Parameter
+    ---------
+    df : pandas.DataFrame
+        DataFrame to be parsed.
+    search_col : list, default is ["Name", "Fueltype", "Technology", "Set"]
+        Set of columns to be parsed. Must be in `df`.
+    config : dict, default None
+        Custom configuration, defaults to
+        `powerplantmatching.config.get_config()`.
+    """
+    if config is None:
+        config = get_config()
+
+    keys = config["target_technologies"]
+    technology = gather_and_replace(df[search_col], keys)
+    return df.assign(Technology=technology)
+
+
+def gather_set_info(df, search_col=["Name", "Fueltype", "Technology"], config=None):
+    """
+    Parses in a set of columns for distinct Set specifications.
+
+    This function uses the mappings (key -> regex pattern) given
+    by the `config` under the section `target_sets`.
+    The representative keys are set if any of the columns
+    in `search_col` matches the regex pattern.
+
+    Parameter
+    ---------
+    df : pandas.DataFrame
+        DataFrame to be parsed.
+    search_col : list, default is ["Name", "Fueltype", "Technology", "Set"]
+        Set of columns to be parsed. Must be in `df`.
+    config : dict, default None
+        Custom configuration, defaults to
+        `powerplantmatching.config.get_config()`.
+    """
+    if config is None:
+        config = get_config()
+
+    keys = config["target_sets"]
+    Set = gather_and_replace(df[search_col], keys)
+    return df.assign(Set=Set)
+
+
+# @deprecated(
+#     deprecated_in="0.5",
+# )
+def clean_technology(df, generalize_hydros=False):
+    """
+    Clean the 'Technology' by condensing down the value into one claim. This
+    procedure might reduce the scope of information, however is crucial for
+    comparing different data sources.
+
+    Parameter
+    ---------
+    search_col : list, default is ['Name', 'Fueltype', 'Technology']
+        Specify the columns to be parsed
+    config : dict, default None
+        Add custom specific configuration,
+        e.g. powerplantmatching.config.get_config(target_countries='Italy'),
+        defaults to powerplantmatching.config.get_config()
+
+    """
+    tech = df["Technology"].dropna()
+    if len(tech) == 0:
+        return df
+    tech = tech.replace({" and ": ", ", " Power Plant": "", "Battery": ""}, regex=True)
+    if generalize_hydros:
+        tech[tech.str.contains("pump", case=False)] = "Pumped Storage"
+        tech[tech.str.contains("reservoir|lake", case=False)] = "Reservoir"
+        tech[tech.str.contains("run-of-river|weir|water", case=False)] = "Run-Of-River"
+        tech[tech.str.contains("dam", case=False)] = "Reservoir"
+    tech = tech.replace({"Gas turbine": "OCGT"})
+    tech[tech.str.contains("combined cycle|combustion", case=False)] = "CCGT"
+    tech[tech.str.contains("steam turbine|critical thermal", case=False)] = (
+        "Steam Turbine"
+    )
+    tech[tech.str.contains("ocgt|open cycle", case=False)] = "OCGT"
+    tech = (
+        tech.str.title()
+        .str.split(", ")
+        .apply(lambda x: ", ".join(i.strip() for i in np.unique(x)))
+    )
+    ABBREVIATIONS = {
+        "Ccgt": "CCGT",
+        "Ocgt": "OCGT",
+        "Pv": "PV",
+        "Nas": "NaS",
+        "Nicd": "NiCd",
+        "Nanicl": "NaNiCl",
+        "Caes": "CAES",
+    }
+    tech = tech.replace(ABBREVIATIONS, regex=False)
+    return df.assign(Technology=tech)
+
+
+def cliques(df, dataduplicates):
+    """
+    Locate cliques of units which are determined to belong to the same
+    powerplant.  Return the same dataframe with an additional column
+    "grouped" which indicates the group that the powerplant is
+    belonging to.
+
+    Parameters
+    ----------
+    df : pandas.Dataframe or string
+        dataframe or csv-file which should be analysed
+    dataduplicates : pandas.Dataframe or string
+        dataframe or name of the csv-linkfile which determines the
+        link within one dataset
+    """
+    #    df = read_csv_if_string(df)
+    G = nx.DiGraph()
+    G.add_nodes_from(df.index)
+    G.add_edges_from((r.one, r.two) for r in dataduplicates.itertuples())
+    H = G.to_undirected(reciprocal=True)
+
+    grouped = pd.Series(np.nan, index=df.index)
+    for i, inds in enumerate(nx.algorithms.clique.find_cliques(H)):
+        grouped.loc[inds] = i
+
+    return df.assign(grouped=grouped)
+
+
+def aggregate_units(
+    df,
+    dataset_name=None,
+    pre_clean_name=False,
+    country_wise=True,
+    config=None,
+    threads=1,
+    **kwargs,
+):
+    """
+    Vertical cleaning of the database. Cleans the "Name"-column, sums
+    up the capacity of powerplant units which are determined to belong
+    to the same plant.
+
+    Parameters
+    ----------
+    df : pandas.Dataframe or string
+        Dataframe or name to use for the resulting database
+    dataset_name : str, default None
+        Specify the name of your df, required if use_saved_aggregation is set
+        to True.
+    pre_clean_name : Boolean, default True
+        Whether to clean the 'Name'-column before aggregating.
+    country_wise : Boolean, default True
+        Whether to aggregate only entries with a identical country.
+    threads : int, default 1
+        Number of threads to use
+    """
+    deprecated_args = {"use_saved_aggregation", "save_aggregation"}
+    used_deprecated_args = deprecated_args.intersection(kwargs)
+    if used_deprecated_args:
+        for arg in used_deprecated_args:
+            kwargs.pop(arg)
+        msg = "The following arguments were deprecated and are being ignored: "
+        logger.warning(msg + f"{used_deprecated_args}")
+
+    df = get_obj_if_Acc(df)
+
+    if config is None:
+        config = get_config()
+
+    if dataset_name is None:
+        ds_name = get_name(df)
+    else:
+        ds_name = dataset_name
+
+    if df.empty:
+        return df.pipe(set_column_name, ds_name)
+
+    cols = config["target_columns"]
+    weighted_cols = list({"Efficiency", "Duration"} & set(cols))
+    str_cols = list({"Name", "Country", "Fueltype", "Technology", "Set"} & set(cols))
+    props_for_groups = {k: v for k, v in AGGREGATION_FUNCTIONS.items() if k in cols}
+
+    df = df.assign(
+        lat=df.lat.astype(float),
+        lon=df.lon.astype(float),
+        **df[weighted_cols].mul(df.Capacity, axis=0),
+        **df[str_cols].fillna("").astype(str),
+    )
+    if pre_clean_name:
+        df = clean_name(df)
+
+    logger.info(f"Aggregating blocks in data source '{ds_name}'.")
+    agg_query = None
+    if ds_name in config.get("aggregate_only_matching_sources", []):
+        for source in config["matching_sources"]:
+            if isinstance(source, dict) and ds_name in source:
+                agg_query = source[ds_name]
+                break
+
+    block_query = None
+    if with_blocks := config["clean_name"].get("fuel_type_with_blocks", []):  # noqa
+        block_query = "Fueltype in @with_blocks"
+
+    if country_wise:
+        countries = df.Country.unique()
+        country_query = "Country == @c"
+        query = " and ".join(filter(None, [agg_query, block_query, country_query]))
+        duplicates = pd.concat(
+            [duke(df.query(query), threads=threads) for c in countries]
+        )
+    else:
+        query = " and ".join(filter(None, [agg_query, block_query]))
+        duplicates = duke(df.query(query) if query else df, threads=threads)
+
+    df = cliques(df, duplicates)
+    df = df.groupby("grouped").agg(props_for_groups)
+
+    no_downcast_ctx = (
+        contextlib.nullcontext()
+        if PANDAS_V3
+        else pd.option_context("future.no_silent_downcasting", True)
+    )
+    with no_downcast_ctx:
+        df[str_cols] = df[str_cols].replace("", pd.NA).infer_objects()
+
+    df = (
+        df.assign(
+            **df[weighted_cols].div(df["Capacity"], axis=0).where(lambda df: df != 0)
+        )
+        .reset_index(drop=True)
+        .pipe(clean_name)
+        .reindex(columns=cols)
+        .pipe(set_column_name, ds_name)
+    )
+
+    # Remove zero values from summed non-weighted numeric columns
+    numeric_cols = df.select_dtypes(include="number").columns
+    df[numeric_cols] = df[numeric_cols].where(lambda df: df != 0)
+
+    return df

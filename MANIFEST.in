@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Contributors to powerplantmatching <https://github.com/pypsa/powerplantmatching>
+#
+# SPDX-License-Identifier: MIT
+
+include powerplantmatching/package_data/*
+include powerplantmatching/package_data/duke_binaries/*
+include README.md LICENSE
+include requirements.yaml
