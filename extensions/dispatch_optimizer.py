@@ -5,77 +5,76 @@ import numpy as np
 
 def run_economic_dispatch(powerplants_df, load_series):
     """
-    运行经济调度优化
-    :param powerplants_df: 电厂数据，需包含 'name', 'Fueltype', 'Capacity', 'marginal_cost'
-    :param load_series: 电力负荷曲线 (pandas Series)
-    :return: 优化后的 PyPSA Network 对象
+    运行经济调度优化，返回包含结果的字典
     """
     # 1. 初始化 PyPSA 网络
     n = pypsa.Network()
-    # 设置时间快照（例如24小时）
     n.set_snapshots(load_series.index)
 
-    # 2. 添加一个“母线”（Bus），代表电力系统的节点
+    # 2. 添加母线
     n.add("Bus", "electricity_bus", carrier="AC")
 
-    # 3. 添加负荷（Load）
+    # 3. 添加负荷
     n.add("Load", "total_load",
           bus="electricity_bus",
           p_set=load_series.values)
 
-    # 4. 将电厂数据转换为 PyPSA 的 Generator 组件
-    #    这里只选取有容量和成本数据的电厂
+    # 4. 添加发电机
     valid_plants = powerplants_df.dropna(subset=['Capacity', 'marginal_cost'])
-
     for idx, plant in valid_plants.iterrows():
         n.add(
             "Generator",
-            plant['Name'],  # 用电厂名称作为唯一ID
+            str(plant['Name']),  # 确保 ID 是字符串，防止冲突
             bus="electricity_bus",
-            p_nom=plant['Capacity'],  # 装机容量 (MW)
-            marginal_cost=plant['marginal_cost'],  # 边际成本 (€/MWh)
-            carrier=plant['Fueltype'],  # 燃料类型，用于分类
+            p_nom=float(plant['Capacity']),
+            marginal_cost=float(plant['marginal_cost']),
+            carrier=str(plant['Fueltype']),
         )
 
-    # 5. 运行优化！PyPSA 会自动选择成本最低的机组组合
+    # 5. 运行优化
     print("开始运行经济调度优化...")
-    n.optimize(log_to_console=False)  # 关闭冗长的日志输出
+    n.optimize(log_to_console=False)
     print("优化完成！")
 
-    return n
+    # 6. 提取结果并打包成字典 (更稳健的写法)
+    generation_df = n.generators_t.p.copy()
+
+    # 用字典映射和 groupby 直接按燃料类型汇总出力，避免 join 报错
+    carrier_map = n.generators['carrier'].to_dict()
+    carrier_df = generation_df.T.groupby(carrier_map).sum().T
+
+    results = {
+        "objective": round(n.objective, 2) if n.objective else 0.0,
+        "snapshots": [str(s) for s in n.snapshots],
+        "load_values": load_series.tolist(),
+        "generation_detail": generation_df.to_dict(orient="list"),
+        "generation_by_carrier": carrier_df.to_dict(orient="list"),  # 这里是画图的关键数据
+        "generators_capacity": n.generators['p_nom'].to_dict(),
+        "generators_carrier": n.generators['carrier'].to_dict()
+    }
+    return results
 
 
 if __name__ == '__main__':
+    # 测试代码保持不变，用来验证后端逻辑
     import powerplantmatching as ppm
-    import numpy as np
-    import pandas as pd
 
     print("1. 正在加载本地数据...")
     df = ppm.powerplants(update=False)
-
-    # 为了测试速度，只取前50个最大电厂，防止算太久
     df = df.sort_values(by='Capacity', ascending=False).head(50).copy()
 
-    # 【关键】PyPSA 需要每个电厂有“边际成本”(marginal_cost)
-    # powerplantmatching 默认没有成本数据，我们按燃料类型写一个简单的成本表
-    print("2. 正在给电厂添加假设的成本...")
     cost_map = {
         'Solar': 0, 'Wind': 0, 'Hydro': 5, 'Nuclear': 10,
         'Natural Gas': 50, 'Hard Coal': 40, 'Lignite': 30, 'Oil': 80
     }
-    df['marginal_cost'] = df['Fueltype'].map(cost_map).fillna(60)  # 其他默认60
+    df['marginal_cost'] = df['Fueltype'].map(cost_map).fillna(60)
 
-    # 3. 构造一个24小时的负荷曲线（模拟一天用电需求）
-    print("3. 生成24小时负荷曲线...")
     load_series = pd.Series(
-        np.linspace(2000, 8000, 24) + np.random.randint(-500, 500, 24),  # 假设负荷在2000-8000MW之间波动
+        np.linspace(2000, 8000, 24) + np.random.randint(-500, 500, 24),
         index=pd.date_range("2026-01-01", periods=24, freq="h")
     )
 
-    # 4. 执行调度算法
-    print("4. 开始执行调度优化...")
-    try:
-        net = run_economic_dispatch(df, load_series)
-        print("5. ✅ 调度完成！总成本为:", round(net.objective, 2))
-    except Exception as e:
-        print("❌ 运行出错:", e)
+    print("2. 开始执行调度优化...")
+    res = run_economic_dispatch(df, load_series)
+    print(f"5. ✅ 调度完成！总成本为: {res['objective']}")
+    print(f"   包含 {len(res['generation_by_carrier'])} 种燃料类型的调度数据。")
